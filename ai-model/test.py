@@ -1,0 +1,1 @@
+print('shuvo lot kop kop')
