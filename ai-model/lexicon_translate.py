@@ -217,11 +217,10 @@ class LexModel:
     def approx(self, w, s, d):
         """closest known source word (inflection / spelling variant) that has a lexicon entry"""
         lex = self.lex[(s, d)]
-        for L in range(len(w) - 1, max(1, len(w) - 5), -1):
-            if L < 2:
-                break
+        min_prefix = max(3, math.ceil(0.6 * len(w)))   # "algeria" must not match "algorithm"
+        for L in range(len(w) - 1, min_prefix - 1, -1):
             for k in self.prefix[s].get(w[:L], [])[:60]:
-                if k in lex and abs(len(k) - len(w)) <= 4:
+                if k in lex and abs(len(k) - len(w)) <= 3:
                     return k
         if s in LATIN:
             pool = [k for k in lex if k[:1] == w[:1] and abs(len(k) - len(w)) <= 2]
@@ -230,7 +229,7 @@ class LexModel:
                 return hit[0]
         return None
 
-    def word_options(self, w, s, d, o):
+    def word_options(self, w, s, d, o, orig=None, is_name=False):
         """-> list of (target_tokens, score, kind)"""
         if o["manual"]:
             man = self.manual.get((s, d), {}).get(w)
@@ -239,11 +238,11 @@ class LexModel:
         direct = self.lex[(s, d)].get(w)
         if direct:
             return [((f,), sc, "lex") for f, sc, _ in direct[:3]]
-        if o["stem"]:
+        if o["stem"] and not is_name:
             k = self.approx(w, s, d)
             if k:
                 return [((f,), sc * 0.7, "stem") for f, sc, _ in self.lex[(s, d)][k][:2]]
-        if o["pivot"]:
+        if o["pivot"] and not is_name:
             best = {}
             for p in ([ALT[s]] if s in ALT else []) + ["bn", "en", "bl"]:
                 if p in (s, d) or p not in self.langs:
@@ -258,7 +257,7 @@ class LexModel:
             if s == "bn" and d in LATIN and bn_roman:
                 return [((bn_roman(w),), 0.05, "copy")]
             if s in LATIN and d in LATIN:
-                return [((w,), 0.05, "copy")]
+                return [(((orig or w),), 0.05, "copy")]
         return [((f"[{w}]",), 0.01, "unk")]
 
     def lm_logp(self, d, prev, w):
@@ -279,6 +278,10 @@ class LexModel:
             if hit:
                 return hit, "similar", []
         toks = tokens(text, s)
+        origs = re.findall(r"[A-Za-z0-9']+", text) if s in LATIN else []
+        if len(origs) != len(toks):
+            origs = list(toks)
+        caps = [bool(o_[:1].isupper()) for o_ in origs] if s in LATIN else [False] * len(toks)
         units, i = [], 0
         while i < len(toks):
             done = False
@@ -292,7 +295,7 @@ class LexModel:
                         done = True
                         break
             if not done:
-                units.append((toks[i], self.word_options(toks[i], s, d, o)))
+                units.append((toks[i], self.word_options(toks[i], s, d, o, origs[i] if s in LATIN else None, caps[i])))
                 i += 1
         # Viterbi over candidates with a target bigram model
         lam = o["lm"]
@@ -392,8 +395,9 @@ ABLATION = [
 ]
 
 
-def cmd_eval(df, split, directions, ablation):
-    train, ev = df[df.split == "train"], df[df.split == split]
+def cmd_eval(df, split, directions, ablation, kind="sentence"):
+    train = df[df.split == "train"]
+    ev = df[(df.split == split) & (df.kind == kind)]
     print("Learning from the TRAIN split only...", file=sys.stderr)
     m = LexModel.build(train, verbose=False)
     Path("results").mkdir(exist_ok=True)
@@ -410,7 +414,8 @@ def cmd_eval(df, split, directions, ablation):
             rows.append({"direction": key, "config": name, "chrF++": round(chrf, 2), "BLEU": round(bleu, 2)})
             print(rows[-1], flush=True)
     res = pd.DataFrame(rows)
-    res.to_csv(f"results/lexicon_scores.{split}{'.ablation' if ablation else ''}.csv", index=False)
+    tag = ("" if kind == "sentence" else "_names") + (".ablation" if ablation else "")
+    res.to_csv(f"results/lexicon_scores.{split}{tag}.csv", index=False)
     if ablation:
         print("\nmean chrF++ over the chosen directions:")
         print(res.groupby("config", sort=False)["chrF++"].mean().round(2).to_string())
@@ -426,6 +431,7 @@ def main():
     ap.add_argument("--split", default="test", choices=["valid", "test"])
     ap.add_argument("--directions", nargs="*", default=None)
     ap.add_argument("--ablation", action="store_true")
+    ap.add_argument("--kind", default="sentence", choices=["sentence", "name"])
     ap.add_argument("--explain", action="store_true")
     ap.add_argument("--lm", type=float, default=None)
     a = ap.parse_intermixed_args()
@@ -435,7 +441,7 @@ def main():
         if a.cmd == "build":
             return cmd_build(df)
         dirs = a.directions or [f"{s}-{d}" for s in LANGS for d in LANGS if s != d]
-        return cmd_eval(df, a.split, dirs, a.ablation)
+        return cmd_eval(df, a.split, dirs, a.ablation, a.kind)
 
     path = OUT / "model.pkl"
     if not path.exists():

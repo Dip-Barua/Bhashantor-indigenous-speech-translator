@@ -28,8 +28,10 @@ ALL_TEXT_COLS = ["English", "Bangla", "Banglish", "Chakma", "Marma"]
 # ----------------------------------------------------------------------------
 # cleaning helpers
 # ----------------------------------------------------------------------------
-def clean_text(s: str, lower: bool = False) -> str:
+def clean_text(s: str, lower: bool = False, latin: bool = False) -> str:
     s = unicodedata.normalize("NFC", str(s))
+    if latin:  # stray Bengali nukta (U+09BC) glued into romanised names, e.g. "Niya\u09bcaj"
+        s = s.replace("\u09bc", "")
     # Bangla nukta letters: make them precomposed so the same letter is always
     # the same code point (NFC leaves them decomposed).
     s = s.replace("\u09a1\u09bc", "\u09dc").replace("\u09a2\u09bc", "\u09dd")
@@ -128,9 +130,11 @@ def flag_rows(df: pd.DataFrame) -> pd.DataFrame:
         if abs(wc_mr - wc_en) >= 2 and (wc_mr / wc_en > 3 or wc_mr / wc_en < 0.34):
             reasons[i].append("marma_length_mismatch")
         for c in ("Chakma", "Marma"):
-            if group_key(r[c]) in (group_key(r["English"]), group_key(r["Banglish"])):
+            if r["kind"] != "name" and group_key(r[c]) in (group_key(r["English"]), group_key(r["Banglish"])):
                 reasons[i].append(f"{c}_copy_of_english_or_banglish")
-        if group_key(r["Chakma"]) == group_key(r["Marma"]):
+        if r["kind"] == "name" and len(r["Bangla"].split()) != len(r["English"].split()):
+            reasons[i].append("name_bangla_wordcount_differs")
+        if group_key(r["Chakma"]) == group_key(r["Marma"]) and r["kind"] != "name":
             reasons[i].append("chakma_equals_marma")
     out = df.loc[list(reasons), ["ID", "English", "Bangla", "Chakma", "Marma"]].copy()
     out["reasons"] = ["; ".join(reasons[i]) for i in out.index]
@@ -168,8 +172,23 @@ def main():
 
     df = raw.copy()
     for c in ALL_TEXT_COLS:
-        df[c] = raw[c].map(lambda s: clean_text(s, lower=(c in ROMAN_COLS)))
+        df[c] = raw[c].map(lambda s: clean_text(s, lower=(c in ROMAN_COLS), latin=(c != "Bangla")))
     df["ID"] = raw["ID"].str.strip()
+
+    # remove explanatory notes like "tw hadi (chakma's traditional dress)" that are not
+    # part of the sentence (only when the English sentence has no brackets itself)
+    for c in ("Banglish", "Chakma", "Marma"):
+        has_note = df[c].str.contains(r"\(") & ~df["English"].str.contains(r"\(")
+        df.loc[has_note, c] = (df.loc[has_note, c]
+                               .str.replace(r"\s*\([^)]*\)", "", regex=True).str.strip())
+
+    # kind: "name" = proper noun / term copied as-is into Chakma and Marma, else "sentence"
+    same = lambda a, b: a.map(group_key) == b.map(group_key)
+    no_punct = ~df["English"].str.strip().str[-1].isin(list(".?!"))
+    df["kind"] = "sentence"
+    is_name = (same(df["Chakma"], df["English"]) & same(df["Marma"], df["English"])) | \
+              (no_punct & (df["English"].map(n_words) <= 2))
+    df.loc[is_name, "kind"] = "name"
 
     # --- flags + audit sample --------------------------------------------
     flagged = flag_rows(df)
@@ -213,27 +232,31 @@ def main():
             for _, r in sub.iterrows():
                 if r[sc] and r[tc]:
                     records.append({
-                        "id": r["ID"], "direction": f"{s}-{t}",
+                        "id": r["ID"], "kind": r["kind"], "direction": f"{s}-{t}",
                         "source": f"<2{t}> {r[sc]}", "source_plain": r[sc],
                         "target": r[tc],
                     })
         pairs = pd.DataFrame(records)
         if split == "train":
             if args.train_per_direction > 0:
-                pairs = (pairs.groupby("direction", group_keys=False)
-                         .apply(lambda g: g.sample(n=min(len(g), args.train_per_direction),
-                                                   random_state=args.seed)))
+                # (do not use groupby.apply here: in pandas >= 3 it drops the "direction" column)
+                parts = [g.sample(n=min(len(g), args.train_per_direction), random_state=args.seed)
+                         for _, g in pairs.groupby("direction", sort=False)]
+                pairs = pd.concat(parts, ignore_index=True)
             pairs = pairs.sample(frac=1.0, random_state=args.seed)  # shuffle
         pairs.to_csv(out / f"{split}_all_directions.tsv", sep="\t", index=False)
         pairs.to_json(out / f"{split}_all_directions.jsonl", orient="records",
                       lines=True, force_ascii=False)
         if split != "train":
-            for d, g in pairs.groupby("direction"):
-                g.to_csv(out / "eval" / f"{split}.{d}.tsv", sep="\t", index=False)
+            for (d, k), g in pairs.groupby(["direction", "kind"]):
+                fname = f"{split}.{d}.tsv" if k == "sentence" else f"{split}_names.{d}.tsv"
+                g.to_csv(out / "eval" / fname, sep="\t", index=False)
 
     stats = {
         "rows_total": len(df),
         "rows_per_split": df["split"].value_counts().to_dict(),
+        "rows_per_kind": df["kind"].value_counts().to_dict(),
+        "kind_by_split": df.groupby(["split", "kind"]).size().unstack(fill_value=0).to_dict(),
         "flagged_rows": len(flagged),
         "flag_reasons": flagged["reasons"].str.split("; ").explode().value_counts().to_dict(),
         "directions": [f"{s}-{t}" for s, t in directions],
